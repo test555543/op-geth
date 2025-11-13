@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/internal/ethapi/override"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -99,10 +100,7 @@ func (api *XlayerHybridBlockChainAPI) shouldProxy(ctx context.Context, bNrOrHash
 
 	if hash, ok := bNrOrHash.Hash(); ok {
 		header := api.BlockChainAPI.GetHeaderByHash(ctx, hash)
-		if header != nil {
-			return false
-		}
-		return true
+		return header == nil
 	}
 
 	return false
@@ -458,15 +456,18 @@ func (api *XlayerHybridTransactionAPI) GetBlockInternalTransactions(ctx context.
 
 // eth_getInternalTransactions TransactionAPI LOCAL
 func (api *XlayerHybridTransactionAPI) GetInternalTransactions(ctx context.Context, txHash common.Hash) ([]*types.InnerTx, error) {
-	// Try local first
-	result, err := api.TransactionAPI.GetInternalTransactions(ctx, txHash)
-	if err == nil && result != nil {
-		return result, nil
+	// Check if the transaction exists locally
+	tx, err := api.TransactionAPI.GetTransactionByHash(ctx, txHash)
+
+	// If transaction doesn't exist locally, try Erigon
+	if tx == nil || err != nil {
+		var remoteResult []*types.InnerTx
+		err := api.legacyRpc.ErigonClient.CallContext(ctx, &remoteResult, "eth_getInternalTransactions", txHash)
+		return remoteResult, err
 	}
-	// If not found locally and migration is configured, try erigon
-	var remoteResult []*types.InnerTx
-	err = api.legacyRpc.ErigonClient.CallContext(ctx, &remoteResult, "eth_getInternalTransactions", txHash)
-	return remoteResult, err
+
+	// Transaction exists locally
+	return api.TransactionAPI.GetInternalTransactions(ctx, txHash)
 }
 
 // eth_getRawTransactionByBlockHashAndIndex TransactionAPI LOCAL
@@ -758,6 +759,16 @@ func (api *XlayerHybridFilterAPI) GetLogs(ctx context.Context, crit filters.Filt
 	}
 
 	return api.FilterAPI.GetLogs(ctx, crit)
+}
+
+func (api *XlayerHybridFilterAPI) Logs(ctx context.Context, crit filters.FilterCriteria) (*rpc.Subscription, error) {
+	migrationBlock := int64(api.legacyRpc.MigrationBlock)
+	if crit.FromBlock != nil && crit.FromBlock.Int64() < migrationBlock {
+		log.Warn("Parameter fromBlock is earlier than migration block, overwriting fromBlock to migrationBlock", "fromBlock", crit.FromBlock.Int64(), "migrationBlock", migrationBlock)
+		crit.FromBlock = big.NewInt(migrationBlock)
+	}
+
+	return api.FilterAPI.Logs(ctx, crit)
 }
 
 // WrapAPIsForXlayer wraps the standard APIs with migration-aware versions
